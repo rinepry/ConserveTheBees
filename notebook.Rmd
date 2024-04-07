@@ -1,0 +1,181 @@
+---
+title: "Conserve the Bees"
+author: "F.J. Morales"
+doi: "GBIF.org (05 January 2024) GBIF Occurrence Download  https://doi.org/10.15468/dl.kktnnk"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+
+Install packages
+```{r install packages, eval=FALSE, include=FALSE}
+install.packages("tidyverse") #cleaning, exploring and analyzing data
+install.packages("rgbif") #communicating with GBIF API
+install.packages("DBI") #connecting to database server
+install.packages("RPostgres") #communicating with PostgreSQL
+install.packages("maps") #getting states and counties from coordinates
+```
+
+Load libraries
+```{r load libraries}
+library(tidyverse)
+library(rgbif)
+library(DBI)
+library(RPostgres)
+library(maps)
+```
+
+Store bee family names on a vector, get their **backbone** and **taxonKey** data
+```{r family}
+familyName <-
+  c(
+    'Apidae',
+    'Halictidae',
+    'Megachilidae',
+    'Andrenidae',
+    'Colletidae',
+    'Melittidae',
+    'Stenotritidae'
+  )
+familyBackbone <- name_backbone_checklist(familyName)
+familyKey <- familyBackbone$usageKey
+```
+
+Get download from **GBIF** query and import it into ***RStudio***
+```{r gbif, eval=FALSE, include=FALSE}
+gbifGet <-
+  occ_download_get(
+    "0057161-231120084113126",
+    path = ".",
+    overwrite = FALSE
+    )
+gbifImport <- occ_download_import(gbifGet)
+```
+
+Connect with **PostgreSQL** database
+```{r postgres, eval=FALSE, include=FALSE}
+postgres <-
+  dbConnect(
+    RPostgres::Postgres(),
+    dbname = 'beedb',
+    host = 'localhost',
+    port = 5432,
+    user = rstudioapi::askForPassword("Please enter user:"),
+    password = rstudioapi::askForPassword("Please enter password:")
+    )
+```
+
+Store occurrences dataset on database
+```{r create table, eval=FALSE, include=FALSE}
+dbWriteTable(postgres, "occurrences", gbifImport)
+```
+
+Rename columns
+```{sql rename columns, eval=FALSE, include=FALSE}
+ALTER TABLE occurrences RENAME COLUMN "gbifID" TO gbifid_;
+ALTER TABLE occurrences RENAME COLUMN family TO family_;
+ALTER TABLE occurrences RENAME COLUMN "scientificName" TO scientificname_;
+ALTER TABLE occurrences RENAME COLUMN "occurrenceStatus" TO status_;
+ALTER TABLE occurrences RENAME COLUMN "individualCount" TO count_;
+ALTER TABLE occurrences RENAME COLUMN "decimalLatitude" TO latitude_;
+ALTER TABLE occurrences RENAME COLUMN "decimalLongitude" TO longitude_;
+ALTER TABLE occurrences RENAME COLUMN "eventDate" TO date_;
+```
+
+Query the dataset into a **dataframe**
+```{r query}
+connection = postgres
+
+occurrencesDataframe <-
+  dbGetQuery(
+    postgres, "
+    SELECT
+      gbifid_,
+      family_,
+      scientificname_,
+      count_,
+      latitude_,
+      longitude_,
+      date_
+    FROM
+      occurrences
+    WHERE
+      status_ = 'PRESENT' AND
+      date_ >= '1923-01-01 00:00:00' AND
+      date_ <= '2023-12-31 23:59:59'
+    ORDER BY
+      date_ ASC"
+    ) %>%
+  mutate(gbifid_ = as.numeric(gbifid_), date_ = as_date(date_))
+
+str(occurrencesDataframe)
+```
+
+_Mutate_ **count_** field to replace nulls with 1 and _floor_ **date_** to month
+```{r count and date}
+occurrencesDataframe <- occurrencesDataframe %>%
+  mutate(count_ = replace_na(count_, 1),)
+
+occurrencesDataframe$date_ <- occurrencesDataframe$date_ %>%
+  floor_date(unit = "month")
+```
+
+Get **state_** and **county_** from coordinates (**latitude_** and **longitude_**)
+```{r coordinates}
+occurrencesDataframe <- occurrencesDataframe[!is.na(occurrencesDataframe$latitude_ | occurrencesDataframe$longitude_),]
+occurrencesDataframe$locality_ <- map.where(database  = "county", occurrencesDataframe$longitude_, occurrencesDataframe$latitude_)
+occurrencesDataframe <- occurrencesDataframe %>%
+  relocate(locality_, .after = count_) %>%
+  separate_wider_delim(locality_, delim = ",", names = c("state_", "county_"))
+
+occurrencesDataframe$state_ <- str_to_title(occurrencesDataframe$state_)
+occurrencesDataframe$county_ <- str_to_title(occurrencesDataframe$county_)
+```
+
+Establish occurrences location
+```{r location}
+locations <- str_to_title(readline(prompt = "Please enter location: "))
+occurrencesTibble <- occurrencesDataframe %>%
+  filter(occurrencesDataframe$state_ == locations)
+
+tibble(occurrencesTibble)
+```
+
+Get **genus_** and **species_** (genus and epithet) from **scientificname_**
+```{r scientific names}
+names <- tibble(name_parse(scientificname = occurrencesTibble$scientificname_, curlopts = list()))
+
+names <-
+  tibble(
+    epithet_ = names$specificepithet,
+    genus_ = names$genusorabove,
+    species_ = names$canonicalname
+  )
+
+names <- replace_na(names, list(genus_ = "Gen.", epithet_ = "sp."))
+
+occurrencesTibble$genus_ <- names$genus_
+occurrencesTibble$species_ <- names$epithet_
+
+occurrencesTibble$species_[occurrencesTibble$species_ != "sp."] <-
+  paste(
+    str_sub(occurrencesTibble$genus_[occurrencesTibble$species_ != "sp."], start = 1, end = 1),
+    occurrencesTibble$species_[occurrencesTibble$species_ != "sp."],
+    sep = ". "
+    )
+
+occurrencesTibble$species_[occurrencesTibble$species_ == "sp."] <-
+  paste(
+    occurrencesTibble$genus_[occurrencesTibble$species_ == "sp."],
+    occurrencesTibble$species_[occurrencesTibble$species_ == "sp."],
+    sep = " "
+    )
+
+occurrencesTibble <- occurrencesTibble %>%
+  relocate(genus_, .after = family_)
+
+occurrencesTibble <- occurrencesTibble %>%
+  relocate(species_, .after = genus_)
+```
